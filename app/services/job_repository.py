@@ -1,7 +1,6 @@
-import redis
 from typing import Dict, Optional
 
-redis_client = redis.Redis(host="localhost", port=6379, decode_responses=True)
+from app.services.redis_client import redis_client
 
 LOCK_TTL_SECONDS = 30  # protects against stuck RUNNING if worker crashes
 
@@ -29,19 +28,11 @@ def get_job(job_id: str) -> Optional[Dict]:
     return redis_client.hgetall(key)
 
 
-def get_status(job_id: str) -> Optional[str]:
-    key = _job_key(job_id)
-    if not redis_client.exists(key):
-        return None
-    return redis_client.hget(key, "status")
-
-
 def try_acquire_lock(job_id: str) -> bool:
     """
-    Idempotency/concurrency guard:
-    - If two workers accidentally get the same job_id, only one proceeds.
+    Concurrency guard: if two workers accidentally get the same job_id, only one proceeds.
+    SET key value NX EX <ttl> => atomic lock acquisition.
     """
-    # SET key value NX EX <ttl>  => atomic lock acquisition
     return bool(redis_client.set(_lock_key(job_id), "1", nx=True, ex=LOCK_TTL_SECONDS))
 
 

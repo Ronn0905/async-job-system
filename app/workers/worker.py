@@ -1,58 +1,23 @@
 import time
 import json
 import random
-import redis
-import os
-from datetime import datetime
+from datetime import datetime, timezone
 
-# -----------------------------
-# ENV LOADING (CRITICAL)
-# -----------------------------
 from dotenv import load_dotenv
-load_dotenv()  # MUST be called in worker process
+load_dotenv()  # MUST be called before any env reads in the worker process
 
-# -----------------------------
-# OpenAI
-# -----------------------------
-from openai import OpenAI
-
-# -----------------------------
-# Internal imports
-# -----------------------------
 from app.models.job import JobStatus
+from app.services.redis_client import redis_client
 from app.services.job_repository import (
     get_job,
     update_job,
     try_acquire_lock,
     release_lock,
 )
-from app.services.queue import move_due_retries_to_queue, schedule_retry
+from app.services.queue import QUEUE_NAME, move_due_retries_to_queue, schedule_retry, push_to_dlq
+from app.ai.tasks import summarize_text
 
-# -----------------------------
-# Redis
-# -----------------------------
-redis_client = redis.Redis(
-    host="localhost",
-    port=6379,
-    decode_responses=True
-)
 
-QUEUE_NAME = "job_queue"
-
-# -----------------------------
-# OpenAI Client (initialized ONCE per worker)
-# -----------------------------
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY")
-if not OPENAI_API_KEY:
-    raise RuntimeError("OPENAI_API_KEY not found in environment")
-
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
-
-openai_client = OpenAI(api_key=OPENAI_API_KEY)
-
-# -----------------------------
-# Retry Backoff
-# -----------------------------
 def compute_backoff_seconds(retry_count: int) -> int:
     """
     Exponential backoff with jitter:
@@ -65,49 +30,11 @@ def compute_backoff_seconds(retry_count: int) -> int:
     jitter = random.randint(0, 2)
     return min(base + jitter, 30)
 
-# -----------------------------
-# AI TASKS
-# -----------------------------
-def ai_text_summary(payload: dict) -> dict:
-    """
-    AI Text Summarization Task
 
-    Expected payload:
-    {
-        "text": "long text to summarize"
-    }
-    """
-    text = payload.get("text")
-    if not text:
-        raise ValueError("Missing 'text' field for AI_TEXT_SUMMARY")
-
-    response = openai_client.chat.completions.create(
-        model=OPENAI_MODEL,
-        messages=[
-            {
-                "role": "system",
-                "content": "Summarize the following text clearly and concisely."
-            },
-            {
-                "role": "user",
-                "content": text
-            }
-        ],
-        temperature=0.3,
-    )
-
-    summary = response.choices[0].message.content
-    return {"summary": summary}
-
-# -----------------------------
-# Task Dispatcher
-# -----------------------------
 def execute_task(task_type: str, payload: dict) -> dict:
-    """
-    Routes job execution based on task_type
-    """
+    """Routes job execution based on task_type."""
     if task_type == "AI_TEXT_SUMMARY":
-        return ai_text_summary(payload)
+        return summarize_text(payload)
 
     # Fallback (legacy test)
     time.sleep(1)
@@ -117,37 +44,40 @@ def execute_task(task_type: str, payload: dict) -> dict:
 
     return {"message": "Succeeded after possible retries"}
 
-# -----------------------------
-# Job Processing
-# -----------------------------
+
 def process_job(job_id: str):
     """
     Executes a job with:
+    - pre-lock idempotency guard
     - distributed lock
-    - idempotency
     - retries with exponential backoff
     - failure handling
     """
+    # Check job state before acquiring lock — no point locking a job we won't process
+    job = get_job(job_id)
+    if not job:
+        return
+    if job.get("status") in (JobStatus.COMPLETED, JobStatus.FAILED):
+        return
+
     if not try_acquire_lock(job_id):
         return
 
     try:
+        # Re-fetch inside the lock to get the authoritative state
         job = get_job(job_id)
         if not job:
             return
-
-        # Idempotency guard
-        if job.get("status") == JobStatus.COMPLETED:
+        if job.get("status") in (JobStatus.COMPLETED, JobStatus.FAILED):
             return
 
         max_retries = int(job.get("max_retries", 3))
         retry_count = int(job.get("retry_count", 0))
 
-        # Mark RUNNING
         update_job(job_id, {
             "status": JobStatus.RUNNING,
-            "updated_at": datetime.utcnow().isoformat(),
-            "failure_reason": ""
+            "updated_at": datetime.now(timezone.utc).isoformat(),
+            "failure_reason": "",
         })
 
         try:
@@ -156,11 +86,10 @@ def process_job(job_id: str):
 
             result = execute_task(task_type, payload)
 
-            # Mark COMPLETED
             update_job(job_id, {
                 "status": JobStatus.COMPLETED,
                 "result": json.dumps(result),
-                "updated_at": datetime.utcnow().isoformat(),
+                "updated_at": datetime.now(timezone.utc).isoformat(),
             })
 
         except Exception as e:
@@ -174,7 +103,7 @@ def process_job(job_id: str):
                     "status": JobStatus.PENDING,
                     "retry_count": retry_count,
                     "failure_reason": str(e),
-                    "updated_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 })
 
                 schedule_retry(job_id, run_at)
@@ -184,21 +113,15 @@ def process_job(job_id: str):
                     "status": JobStatus.FAILED,
                     "retry_count": retry_count,
                     "failure_reason": str(e),
-                    "updated_at": datetime.utcnow().isoformat(),
+                    "updated_at": datetime.now(timezone.utc).isoformat(),
                 })
+                push_to_dlq(job_id)
 
     finally:
         release_lock(job_id)
 
-# -----------------------------
-# Worker Loop
-# -----------------------------
+
 def worker_loop():
-    """
-    Worker lifecycle:
-    - moves due retries
-    - blocks waiting for jobs
-    """
     print("Worker started. Waiting for jobs...")
 
     while True:
@@ -211,8 +134,6 @@ def worker_loop():
         _, job_id = item
         process_job(job_id)
 
-# -----------------------------
-# Entrypoint
-# -----------------------------
+
 if __name__ == "__main__":
     worker_loop()
